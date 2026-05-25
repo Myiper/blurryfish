@@ -5,28 +5,7 @@ services:
     region: oregon        # change to frankfurt / singapore if preferred
     plan: free            # upgrade to starter for persistent disk & more RAM
     rootDir: backend
-    buildCommand: |
-      pip install -r requirements.txt huggingface_hub &&
-      python -c "
-      import os, shutil, sys
-      from huggingface_hub import hf_hub_download
-      token = os.environ.get('HF_TOKEN')
-      repo  = 'Myiper/blurryfish-weights'
-      base  = os.path.dirname(os.path.abspath('main.py'))
-      dest  = os.path.join(base, 'models')
-      os.makedirs(dest, exist_ok=True)
-      print(f'Saving models to: {dest}')
-      for f in ['denoising_unet.pth', 'best.pt', 'RealESRGAN_x4plus.pth']:
-          try:
-              src = hf_hub_download(repo_id=repo, filename=f, token=token)
-              out = os.path.join(dest, f)
-              shutil.copy(src, out)
-              size = os.path.getsize(out)
-              print(f'OK  {f}  ({size:,} bytes)')
-          except Exception as e:
-              print(f'FAIL {f}: {e}', file=sys.stderr)
-              sys.exit(1)
-      "
+    buildCommand: bash build.sh
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: PYTHON_VERSION
