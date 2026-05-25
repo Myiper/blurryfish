@@ -5,11 +5,25 @@ services:
     region: oregon        # change to frankfurt / singapore if preferred
     plan: free            # upgrade to starter for persistent disk & more RAM
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install -r requirements.txt huggingface_hub &&
+      python -c "
+      import os, shutil
+      from huggingface_hub import hf_hub_download
+      token = os.environ.get('HF_TOKEN')
+      repo  = 'Myiper/blurryfish-weights'
+      os.makedirs('models', exist_ok=True)
+      for f in ['denoising_unet.pth', 'best.pt', 'RealESRGAN_x4plus.pth']:
+          src = hf_hub_download(repo_id=repo, filename=f, token=token)
+          shutil.copy(src, f'models/{f}')
+          print(f'Downloaded {f}')
+      "
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: HF_TOKEN
+        sync: false        # set this secret in the Render dashboard
     healthCheckPath: /health
     # Render free tier sleeps after inactivity.
     # Use a cron job or UptimeRobot to keep it alive if needed.
