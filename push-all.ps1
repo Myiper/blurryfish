@@ -71,17 +71,18 @@ try {
     New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
     Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
 
-    # Copy contents of backend/ subfolder into HF clone root
+    # ── MIRROR step: wipe all working files from the HF clone before copying ──
+    # This ensures files deleted locally are also deleted on Hugging Face.
+    # We remove everything EXCEPT the .git folder.
+    Get-ChildItem -Path $TmpDir -Force | Where-Object { $_.Name -ne ".git" } | ForEach-Object {
+        Remove-Item -Path $_.FullName -Recurse -Force
+    }
+
+    # Now copy the fresh backend/ export into the clean HF clone root
     $BackendExtracted = Join-Path $ExtractDir "backend"
-    if (Test-Path $BackendExtracted) {
-        Get-ChildItem -Path $BackendExtracted -Force | ForEach-Object {
-            Copy-Item -Path $_.FullName -Destination $TmpDir -Recurse -Force
-        }
-    } else {
-        # Fallback: contents already at root of zip
-        Get-ChildItem -Path $ExtractDir -Force | ForEach-Object {
-            Copy-Item -Path $_.FullName -Destination $TmpDir -Recurse -Force
-        }
+    $SourceDir = if (Test-Path $BackendExtracted) { $BackendExtracted } else { $ExtractDir }
+    Get-ChildItem -Path $SourceDir -Force | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $TmpDir -Recurse -Force
     }
 
     # Stage all changes
