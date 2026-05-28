@@ -95,7 +95,7 @@ _storage: Optional[StorageBackend] = None
 def _download_models_if_needed() -> None:
     """
     Download model weights from Hugging Face if they are missing locally.
-    Uses HF_TOKEN env var (set as a runtime secret in HF Spaces / Render).
+    Uses HF_TOKEN env var (set as a runtime secret in HF Spaces).
     Safe to call in local dev — skips files that already exist.
     """
     hf_token = os.environ.get("HF_TOKEN")
