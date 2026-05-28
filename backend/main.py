@@ -92,10 +92,48 @@ _models: dict = {}
 _storage: Optional[StorageBackend] = None
 
 
+def _download_models_if_needed() -> None:
+    """
+    Download model weights from Hugging Face if they are missing locally.
+    Uses HF_TOKEN env var (set as a runtime secret in HF Spaces / Render).
+    Safe to call in local dev — skips files that already exist.
+    """
+    hf_token = os.environ.get("HF_TOKEN")
+    hf_repo  = os.environ.get("HF_REPO", "Myiper/blurryfish-weights")
+    weights  = {
+        "denoising_unet.pth":    UNET_WEIGHTS,
+        "best.pt":               YOLO_WEIGHTS,
+        "RealESRGAN_x4plus.pth": ESRGAN_WEIGHTS,
+    }
+
+    missing = {name: dest for name, dest in weights.items() if not os.path.exists(dest)}
+    if not missing:
+        logger.info("All model weights already present — skipping download.")
+        return
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        logger.warning("huggingface_hub not installed — cannot auto-download weights.")
+        return
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    for filename, dest_path in missing.items():
+        logger.info("Downloading %s from %s …", filename, hf_repo)
+        try:
+            import shutil
+            cached = hf_hub_download(repo_id=hf_repo, filename=filename, token=hf_token)
+            shutil.copy(cached, dest_path)
+            logger.info("  ✓ %s  (%s bytes)", filename, f"{os.path.getsize(dest_path):,}")
+        except Exception as exc:
+            logger.error("  ✗ Failed to download %s: %s", filename, exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load all models and storage backend during startup."""
     global _storage
+    _download_models_if_needed()
     logger.info("Loading models…")
     _models["unet"]   = load_unet(UNET_WEIGHTS)
     _models["yolo"]   = load_yolo(YOLO_WEIGHTS)

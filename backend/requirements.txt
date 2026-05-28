@@ -28,9 +28,5 @@ torchvision==0.20.1+cpu
 # supabase==2.9.1
 
 # ── Optional: Real-ESRGAN upscaling ─────────────────────────────────────────
-# Uncomment these if you want Real-ESRGAN support on the server.
-# They add ~500 MB to the build — only enable if using a paid Render plan.
-# basicsr==1.4.2
-# realesrgan==0.3.0
-# facexlib==0.3.0
-# gfpgan==1.3.8
+# Installed separately in Dockerfile with --no-build-isolation
+# (basicsr uses a legacy setup.py that conflicts with newer setuptools+CUDA)
