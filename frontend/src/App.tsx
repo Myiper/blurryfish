@@ -7,6 +7,7 @@ import {
   runDetection,
   runUpscaling,
   runFullPipeline,
+  b64ToFile,
 } from './api';
 import type {
   HealthStatus,
@@ -22,6 +23,7 @@ import HealthBadge from './components/HealthBadge';
 import ProgressBar from './components/ProgressBar';
 import StepCard from './components/StepCard';
 import StepCardUpscaling from './components/StepCardUpscaling';
+import FishAnnotator from './components/FishAnnotator';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -112,6 +114,8 @@ export default function App() {
   const [errors, setErrors] = useState<Partial<Record<keyof StepLoadingMap, string>>>({});
   const [progress, setProgress] = useState(0);
   const [pipelineRunning, setPipelineRunning] = useState(false);
+  // Base64 data URI of the uploaded file — used as FishAnnotator background fallback
+  const [fileBase64, setFileBase64] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
 
@@ -123,6 +127,15 @@ export default function App() {
       .catch(() => setHealth(null))
       .finally(() => setHealthLoading(false));
   }, []);
+
+  // ── Convert uploaded file → base64 so FishAnnotator can display it ────────
+
+  useEffect(() => {
+    if (!file) { setFileBase64(null); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => setFileBase64((e.target?.result as string) ?? null);
+    reader.readAsDataURL(file);
+  }, [file]);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -197,6 +210,38 @@ export default function App() {
     [file, results.detection?.boxes, setStepLoading]
   );
 
+  // ── Manual upscaling from FishAnnotator ──────────────────────────────────
+
+  const handleManualUpscaling = useCallback(
+    async (manualBoxes: BoundingBox[]) => {
+      if (manualBoxes.length === 0 || !file) return;
+      setStepLoading('upscaling', true);
+      clearError('upscaling');
+      try {
+        // Prefer the denoised image (same source detection used); fall back to raw upload
+        const src = results.unet_denoising?.image
+          ? b64ToFile(results.unet_denoising.image, 'denoised.png')
+          : file;
+        const r = await runUpscaling(src, manualBoxes);
+        setResults((p) => ({
+          ...p,
+          upscaling: r,
+          crops: r.crops,
+          upscaled_images: r.upscaled,
+          crop_urls: r.crop_urls,
+          upscaled_urls: r.upscaled_urls,
+          upscale_method: r.method,
+          upscale_fish_count: r.fishCount,
+        }));
+      } catch (err) {
+        setError('upscaling', (err as Error).message);
+      } finally {
+        setStepLoading('upscaling', false);
+      }
+    },
+    [file, results.unet_denoising, setStepLoading],
+  );
+
   // ── Full pipeline (SSE) ───────────────────────────────────────────────────
 
   const runAll = useCallback(async () => {
@@ -265,6 +310,10 @@ export default function App() {
     setPipelineRunning(false);
     setStepLoading('all', false);
   };
+
+  // ── Image shown in FishAnnotator (clean, no YOLO annotations) ───────────
+  // Prefer the denoised image; fall back to the raw uploaded file as data URI.
+  const annotatorImage = results.unet_denoising?.image ?? fileBase64 ?? null;
 
   // ── Upscaling has result if either came from full pipeline or individual ──
   const hasUpscalingResult =
@@ -500,6 +549,17 @@ export default function App() {
             />
           )}
           {errors.detection && <ErrorBanner msg={errors.detection} />}
+
+          {/* Fish Selection Editor — always shown under detection */}
+          {results.detection && annotatorImage && (
+            <FishAnnotator
+              imageBase64={annotatorImage}
+              initialBoxes={results.detection.boxes ?? []}
+              onRunUpscaling={handleManualUpscaling}
+              loading={loading.upscaling}
+              animDelay={350}
+            />
+          )}
 
           {/* Upscaling */}
           {hasUpscalingResult && (

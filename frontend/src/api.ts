@@ -146,3 +146,14 @@ export function b64ToDataUri(b64: string): string {
   if (b64.startsWith('data:')) return b64;
   return `data:image/png;base64,${b64}`;
 }
+
+/** Convert a base64 string or data URI to a File object */
+export function b64ToFile(b64: string, filename = 'image.png'): File {
+  const dataUri = b64ToDataUri(b64);
+  const [header, data] = dataUri.split(',');
+  const mime = header.match(/data:(.*?);/)?.[1] ?? 'image/png';
+  const bstr = atob(data);
+  const bytes = new Uint8Array(bstr.length);
+  for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
+  return new File([bytes], filename, { type: mime });
+}

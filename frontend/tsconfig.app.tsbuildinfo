@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/healthbadge.tsx","./src/components/progressbar.tsx","./src/components/stepcard.tsx","./src/components/stepcardupscaling.tsx","./src/components/uploadzone.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/fishannotator.tsx","./src/components/healthbadge.tsx","./src/components/progressbar.tsx","./src/components/stepcard.tsx","./src/components/stepcardupscaling.tsx","./src/components/uploadzone.tsx"],"version":"5.9.3"}
