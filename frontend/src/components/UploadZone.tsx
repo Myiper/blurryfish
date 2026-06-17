@@ -20,15 +20,6 @@ const FISH_SVG = (
   </svg>
 );
 
-const VIDEO_SVG = (
-  <svg viewBox="0 0 64 40" fill="none" className="w-16 h-10 opacity-60">
-    <rect x="4" y="6" width="36" height="28" rx="3" fill="currentColor" opacity="0.3" />
-    <path d="M44 14 L60 8 L60 32 L44 26 Z" fill="currentColor" opacity="0.3" />
-    <circle cx="22" cy="20" r="6" fill="currentColor" opacity="0.5" />
-    <path d="M19 17 L27 20 L19 23 Z" fill="currentColor" opacity="0.9" />
-  </svg>
-);
-
 export default function UploadZone({ onFile, file, mode, disabled }: Props) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
