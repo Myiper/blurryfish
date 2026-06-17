@@ -70,6 +70,36 @@ export interface FinalEvent extends SingleImageStep {
   upscaledCount: number;
 }
 
+export interface VideoStartEvent {
+  step: 'video_start';
+  totalFrames: number;
+  fps: number;
+  width: number;
+  height: number;
+  job_id: string;
+}
+
+export interface VideoProgressEvent {
+  step: 'video_progress';
+  frame: number;
+  totalFrames: number;
+  percent: number;
+  job_id: string;
+}
+
+export interface VideoDoneEvent {
+  step: 'video_done';
+  frameCount: number;
+  totalFrames: number;
+  download_url: string;
+  job_id: string;
+}
+
+export interface VideoErrorEvent {
+  step: 'video_error';
+  error: string;
+}
+
 export type SSEEvent =
   | ClaheResult
   | ColorCorrectionResult
@@ -77,7 +107,11 @@ export type SSEEvent =
   | DetectionResult
   | CropsEvent
   | UpscaledEvent
-  | FinalEvent;
+  | FinalEvent
+  | VideoStartEvent
+  | VideoProgressEvent
+  | VideoDoneEvent
+  | VideoErrorEvent;
 
 // ─── App-level state types ───────────────────────────────────────────────────
 

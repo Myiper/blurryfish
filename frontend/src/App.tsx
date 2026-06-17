@@ -7,6 +7,7 @@ import {
   runDetection,
   runUpscaling,
   runFullPipeline,
+  runVideoProcessing,
   b64ToFile,
 } from './api';
 import type {
@@ -17,13 +18,18 @@ import type {
   DetectionResult,
   UpscalingResult,
   BoundingBox,
+  VideoStartEvent,
+  VideoProgressEvent,
+  VideoDoneEvent,
 } from './types';
 import UploadZone from './components/UploadZone';
+import type { InputMode } from './components/UploadZone';
 import HealthBadge from './components/HealthBadge';
 import ProgressBar from './components/ProgressBar';
 import StepCard from './components/StepCard';
 import StepCardUpscaling from './components/StepCardUpscaling';
 import FishAnnotator from './components/FishAnnotator';
+import VideoResultCard from './components/VideoResultCard';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -41,6 +47,32 @@ interface Results {
   upscale_method?: 'realesrgan' | 'lanczos';
   upscale_fish_count?: number;
 }
+
+interface VideoState {
+  processing: boolean;
+  percent: number;
+  framesProcessed: number;
+  totalFrames: number;
+  fps: number;
+  width: number;
+  height: number;
+  downloadUrl?: string;
+  frameCount?: number;
+  error?: string;
+  /** True once we've received at least video_start */
+  started: boolean;
+}
+
+const EMPTY_VIDEO: VideoState = {
+  processing: false,
+  percent: 0,
+  framesProcessed: 0,
+  totalFrames: 0,
+  fps: 0,
+  width: 0,
+  height: 0,
+  started: false,
+};
 
 interface StepLoadingMap {
   clahe: boolean;
@@ -100,6 +132,7 @@ const STEPS = [
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
+  const [inputMode, setInputMode] = useState<InputMode>('image');
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [healthLoading, setHealthLoading] = useState(true);
   const [results, setResults] = useState<Results>({});
@@ -117,6 +150,10 @@ export default function App() {
   // Base64 data URI of the uploaded file — used as FishAnnotator background fallback
   const [fileBase64, setFileBase64] = useState<string | null>(null);
 
+  // ── Video-specific state ──────────────────────────────────────────────────
+  const [videoState, setVideoState] = useState<VideoState>(EMPTY_VIDEO);
+  const videoAbortRef = useRef<AbortController | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
 
   // ── Health check ─────────────────────────────────────────────────────────
@@ -128,14 +165,26 @@ export default function App() {
       .finally(() => setHealthLoading(false));
   }, []);
 
-  // ── Convert uploaded file → base64 so FishAnnotator can display it ────────
+  // ── Convert uploaded image file → base64 so FishAnnotator can display it ─
 
   useEffect(() => {
-    if (!file) { setFileBase64(null); return; }
+    if (!file || inputMode === 'video') { setFileBase64(null); return; }
     const reader = new FileReader();
     reader.onload = (e) => setFileBase64((e.target?.result as string) ?? null);
     reader.readAsDataURL(file);
-  }, [file]);
+  }, [file, inputMode]);
+
+  // ── File upload handler (unified for image + video) ───────────────────────
+
+  const handleFile = useCallback((f: File, mode: InputMode) => {
+    setFile(f);
+    setInputMode(mode);
+    // Reset all results when a new file is uploaded
+    setResults({});
+    setErrors({});
+    setProgress(0);
+    setVideoState(EMPTY_VIDEO);
+  }, []);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -151,7 +200,7 @@ export default function App() {
     setErrors((prev) => ({ ...prev, [step]: msg }));
   };
 
-  // ── Individual step runners ───────────────────────────────────────────────
+  // ── Individual step runners (image mode only) ─────────────────────────────
 
   const runStep = useCallback(
     async (stepId: keyof StepLoadingMap, fileOverride?: File) => {
@@ -242,7 +291,7 @@ export default function App() {
     [file, results.unet_denoising, setStepLoading],
   );
 
-  // ── Full pipeline (SSE) ───────────────────────────────────────────────────
+  // ── Full image pipeline (SSE) ─────────────────────────────────────────────
 
   const runAll = useCallback(async () => {
     if (!file) return;
@@ -311,6 +360,73 @@ export default function App() {
     setStepLoading('all', false);
   };
 
+  // ── Video pipeline ────────────────────────────────────────────────────────
+
+  const runVideo = useCallback(async () => {
+    if (!file) return;
+    videoAbortRef.current?.abort();
+    const controller = new AbortController();
+    videoAbortRef.current = controller;
+
+    setVideoState(EMPTY_VIDEO);
+    setErrors({});
+
+    try {
+      for await (const event of runVideoProcessing(file, controller.signal)) {
+        if (event.step === 'video_start') {
+          const e = event as VideoStartEvent;
+          setVideoState({
+            processing: true,
+            percent: 0,
+            framesProcessed: 0,
+            totalFrames: e.totalFrames,
+            fps: e.fps,
+            width: e.width,
+            height: e.height,
+            started: true,
+          });
+        } else if (event.step === 'video_progress') {
+          const e = event as VideoProgressEvent;
+          setVideoState((prev) => ({
+            ...prev,
+            percent: e.percent,
+            framesProcessed: e.frame,
+          }));
+        } else if (event.step === 'video_done') {
+          const e = event as VideoDoneEvent;
+          setVideoState((prev) => ({
+            ...prev,
+            processing: false,
+            percent: 100,
+            framesProcessed: e.frameCount,
+            downloadUrl: e.download_url,
+            frameCount: e.frameCount,
+          }));
+        } else if (event.step === 'video_error') {
+          const e = event as any;
+          setVideoState((prev) => ({
+            ...prev,
+            processing: false,
+            error: e.error ?? 'An unknown error occurred.',
+          }));
+        }
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        setVideoState((prev) => ({
+          ...prev,
+          processing: false,
+          error: (err as Error).message,
+        }));
+      }
+    }
+  }, [file]);
+
+  const stopVideo = () => {
+    videoAbortRef.current?.abort();
+    setVideoState((prev) => ({ ...prev, processing: false }));
+  };
+
   // ── Image shown in FishAnnotator (clean, no YOLO annotations) ───────────
   // Prefer the denoised image; fall back to the raw uploaded file as data URI.
   const annotatorImage = results.unet_denoising?.image ?? fileBase64 ?? null;
@@ -326,6 +442,8 @@ export default function App() {
   const upscalingUpscaledUrls = results.upscaled_urls ?? results.upscaling?.upscaled_urls ?? [];
   const upscalingMethod = results.upscale_method ?? results.upscaling?.method;
   const upscalingFishCount = results.upscale_fish_count ?? results.upscaling?.fishCount;
+
+  const isVideoMode = inputMode === 'video';
 
   // ─────────────────────────────────────────────────────────────────────────
   // Render
@@ -367,7 +485,7 @@ export default function App() {
               <h1 className="text-white font-extrabold text-xl tracking-tight glow-text">
                 BlurryFish
               </h1>
-              <p className="text-white/30 text-xs">Underwater image restoration</p>
+              <p className="text-white/30 text-xs">Underwater image & video restoration</p>
             </div>
           </div>
           <HealthBadge health={health} loading={healthLoading} />
@@ -382,89 +500,141 @@ export default function App() {
           <h2 className="text-3xl sm:text-4xl font-extrabold text-white">
             Restore your{' '}
             <span className="bg-gradient-to-r from-cyan-400 to-teal-400 bg-clip-text text-transparent">
-              underwater images
+              underwater footage
             </span>
           </h2>
           <p className="text-white/40 text-base max-w-xl mx-auto">
-            AI-powered pipeline: CLAHE contrast enhancement → color correction → U-Net denoising → fish detection → super-resolution upscaling.
+            AI-powered pipeline: CLAHE → color correction → U-Net denoising → fish detection.
+            Supports both images and videos (up to 10 s).
           </p>
         </section>
 
         {/* Upload zone */}
         <section id="upload-section">
           <UploadZone
-            onFile={setFile}
+            onFile={handleFile}
             file={file}
-            disabled={loading.all}
+            mode={inputMode}
+            disabled={loading.all || videoState.processing}
           />
         </section>
 
-        {/* Control panel */}
+        {/* ── Control panel ─────────────────────────────────────────────── */}
         <section id="controls-section" className="glass-card p-5">
-          <div className="flex flex-col sm:flex-row items-center gap-4">
-            {/* Run All */}
-            <div className="flex items-center gap-3 flex-1">
-              <button
-                id="run-all-btn"
-                className="btn-primary flex items-center gap-2 text-base px-8 py-3"
-                disabled={!file || loading.all}
-                onClick={pipelineRunning ? stopPipeline : runAll}
-              >
-                {pipelineRunning ? (
-                  <>
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
-                      <rect x="3" y="3" width="4" height="10" rx="1" />
-                      <rect x="9" y="3" width="4" height="10" rx="1" />
-                    </svg>
-                    Stop
-                  </>
-                ) : loading.all ? (
-                  <>
-                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 16 16">
-                      <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="10"/>
-                    </svg>
-                    Running…
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 16 16">
-                      <path d="M5 3l8 5-8 5V3z" fill="currentColor"/>
-                    </svg>
-                    Run All Steps
-                  </>
-                )}
-              </button>
-              {!file && (
-                <span className="text-white/30 text-sm">← Upload an image first</span>
-              )}
-            </div>
-
-            {/* Divider */}
-            <div className="hidden sm:block w-px h-10 bg-white/10" />
-
-            {/* Individual step buttons */}
-            <div className="flex flex-wrap gap-2 justify-center sm:justify-end">
-              {STEPS.map((step) => (
+          {isVideoMode ? (
+            /* ── VIDEO mode controls ──────────────────────────────────── */
+            <div className="flex flex-col sm:flex-row items-center gap-4">
+              <div className="flex items-center gap-3 flex-1">
                 <button
-                  key={step.id}
-                  id={`run-${step.id}-btn`}
-                  className="btn-secondary flex items-center gap-1.5"
-                  disabled={!file || loading[step.id] || loading.all}
-                  title={`Run ${step.label} individually. Input: ${step.inputHint}`}
-                  onClick={() => runStep(step.id)}
+                  id="process-video-btn"
+                  className="btn-primary flex items-center gap-2 text-base px-8 py-3"
+                  style={{ background: 'linear-gradient(135deg, #a855f7, #7c3aed)' }}
+                  disabled={!file || videoState.processing}
+                  onClick={videoState.processing ? stopVideo : runVideo}
                 >
-                  {loading[step.id] ? (
-                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 16 16">
-                      <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="10"/>
-                    </svg>
+                  {videoState.processing ? (
+                    <>
+                      <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
+                        <rect x="3" y="3" width="4" height="10" rx="1" />
+                        <rect x="9" y="3" width="4" height="10" rx="1" />
+                      </svg>
+                      Stop
+                    </>
                   ) : (
-                    <span className="text-cyan-400/60 font-mono text-xs">{step.subStep}</span>
+                    <>
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 16 16">
+                        <path d="M5 3l8 5-8 5V3z" fill="currentColor"/>
+                      </svg>
+                      Process Video
+                    </>
                   )}
-                  {step.label}
                 </button>
-              ))}
+                {!file && (
+                  <span className="text-white/30 text-sm">← Upload a video first</span>
+                )}
+                {file && !videoState.processing && !videoState.started && (
+                  <span className="text-white/30 text-sm">
+                    🎬 Video mode — only first 10 s will be processed
+                  </span>
+                )}
+              </div>
+
+              {/* Mode indicator pill */}
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-purple-500/10 border border-purple-400/20 text-purple-300 text-xs font-medium">
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 16 16">
+                  <rect x="1" y="3" width="10" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.5"/>
+                  <path d="M11 7l4-2v6l-4-2V7z" fill="currentColor"/>
+                </svg>
+                Video Mode
+              </div>
             </div>
-          </div>
+          ) : (
+            /* ── IMAGE mode controls ──────────────────────────────────── */
+            <div className="flex flex-col sm:flex-row items-center gap-4">
+              {/* Run All */}
+              <div className="flex items-center gap-3 flex-1">
+                <button
+                  id="run-all-btn"
+                  className="btn-primary flex items-center gap-2 text-base px-8 py-3"
+                  disabled={!file || loading.all}
+                  onClick={pipelineRunning ? stopPipeline : runAll}
+                >
+                  {pipelineRunning ? (
+                    <>
+                      <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
+                        <rect x="3" y="3" width="4" height="10" rx="1" />
+                        <rect x="9" y="3" width="4" height="10" rx="1" />
+                      </svg>
+                      Stop
+                    </>
+                  ) : loading.all ? (
+                    <>
+                      <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 16 16">
+                        <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="10"/>
+                      </svg>
+                      Running…
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 16 16">
+                        <path d="M5 3l8 5-8 5V3z" fill="currentColor"/>
+                      </svg>
+                      Run All Steps
+                    </>
+                  )}
+                </button>
+                {!file && (
+                  <span className="text-white/30 text-sm">← Upload an image first</span>
+                )}
+              </div>
+
+              {/* Divider */}
+              <div className="hidden sm:block w-px h-10 bg-white/10" />
+
+              {/* Individual step buttons */}
+              <div className="flex flex-wrap gap-2 justify-center sm:justify-end">
+                {STEPS.map((step) => (
+                  <button
+                    key={step.id}
+                    id={`run-${step.id}-btn`}
+                    className="btn-secondary flex items-center gap-1.5"
+                    disabled={!file || loading[step.id] || loading.all}
+                    title={`Run ${step.label} individually. Input: ${step.inputHint}`}
+                    onClick={() => runStep(step.id)}
+                  >
+                    {loading[step.id] ? (
+                      <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 16 16">
+                        <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="10"/>
+                      </svg>
+                    ) : (
+                      <span className="text-cyan-400/60 font-mono text-xs">{step.subStep}</span>
+                    )}
+                    {step.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Global error */}
           {errors.all && (
@@ -474,117 +644,156 @@ export default function App() {
           )}
         </section>
 
-        {/* Progress bar */}
+        {/* Progress bar (image mode only) */}
         <ProgressBar
           progress={progress}
           visible={pipelineRunning || (loading.all && progress > 0)}
         />
 
-        {/* ── Step results ─────────────────────────────────────────────── */}
-        <section id="results-section" className="space-y-5">
-          {/* CLAHE */}
-          {results.clahe && (
-            <StepCard
-              stepId="clahe"
-              label="CLAHE Enhancement"
-              subStep="1a"
-              description={results.clahe.description}
-              result={results.clahe}
-              status={loading.clahe ? 'loading' : 'success'}
-              onRerun={(f) => runStep('clahe', f)}
-              onRerunWithCurrent={() => runStep('clahe')}
-              loading={loading.clahe}
-              animDelay={0}
-            />
-          )}
-          {errors.clahe && <ErrorBanner msg={errors.clahe} />}
+        {/* ── Results ──────────────────────────────────────────────────── */}
 
-          {/* Color Correction */}
-          {results.color_correction && (
-            <StepCard
-              stepId="color_correction"
-              label="Color Correction"
-              subStep="1b"
-              description={results.color_correction.description}
-              result={results.color_correction}
-              status={loading.color_correction ? 'loading' : 'success'}
-              onRerun={(f) => runStep('color_correction', f)}
-              onRerunWithCurrent={() => runStep('color_correction')}
-              loading={loading.color_correction}
-              animDelay={100}
-            />
-          )}
-          {errors.color_correction && <ErrorBanner msg={errors.color_correction} />}
+        {isVideoMode ? (
+          /* ── VIDEO results ──────────────────────────────────────────── */
+          <section id="results-section" className="space-y-5">
+            {videoState.started && (
+              <VideoResultCard
+                totalFrames={videoState.totalFrames}
+                fps={videoState.fps}
+                width={videoState.width}
+                height={videoState.height}
+                percent={videoState.percent}
+                framesProcessed={videoState.framesProcessed}
+                downloadUrl={videoState.downloadUrl}
+                frameCount={videoState.frameCount}
+                error={videoState.error}
+                processing={videoState.processing}
+                animDelay={0}
+              />
+            )}
+            {!videoState.started && !videoState.processing && file && (
+              <div className="text-center py-10 text-white/20">
+                <div className="text-4xl mb-3">🎬</div>
+                <p className="text-base font-medium">Press "Process Video" to start</p>
+                <p className="text-sm mt-1">Results will stream in frame by frame</p>
+              </div>
+            )}
+          </section>
+        ) : (
+          /* ── IMAGE results ──────────────────────────────────────────── */
+          <section id="results-section" className="space-y-5">
+            {/* CLAHE */}
+            {results.clahe && (
+              <StepCard
+                stepId="clahe"
+                label="CLAHE Enhancement"
+                subStep="1a"
+                description={results.clahe.description}
+                result={results.clahe}
+                status={loading.clahe ? 'loading' : 'success'}
+                onRerun={(f) => runStep('clahe', f)}
+                onRerunWithCurrent={() => runStep('clahe')}
+                loading={loading.clahe}
+                animDelay={0}
+              />
+            )}
+            {errors.clahe && <ErrorBanner msg={errors.clahe} />}
 
-          {/* U-Net Denoising */}
-          {results.unet_denoising && (
-            <StepCard
-              stepId="unet_denoising"
-              label="U-Net Denoising"
-              subStep="1c"
-              description={results.unet_denoising.description}
-              result={results.unet_denoising}
-              status={loading.unet_denoising ? 'loading' : 'success'}
-              onRerun={(f) => runStep('unet_denoising', f)}
-              onRerunWithCurrent={() => runStep('unet_denoising')}
-              loading={loading.unet_denoising}
-              animDelay={200}
-            />
-          )}
-          {errors.unet_denoising && <ErrorBanner msg={errors.unet_denoising} />}
+            {/* Color Correction */}
+            {results.color_correction && (
+              <StepCard
+                stepId="color_correction"
+                label="Color Correction"
+                subStep="1b"
+                description={results.color_correction.description}
+                result={results.color_correction}
+                status={loading.color_correction ? 'loading' : 'success'}
+                onRerun={(f) => runStep('color_correction', f)}
+                onRerunWithCurrent={() => runStep('color_correction')}
+                loading={loading.color_correction}
+                animDelay={100}
+              />
+            )}
+            {errors.color_correction && <ErrorBanner msg={errors.color_correction} />}
 
-          {/* Fish Detection */}
-          {results.detection && (
-            <StepCard
-              stepId="detection"
-              label="Fish Detection"
-              subStep="2"
-              description={results.detection.description}
-              result={results.detection}
-              status={loading.detection ? 'loading' : 'success'}
-              onRerun={(f) => runStep('detection', f)}
-              onRerunWithCurrent={() => runStep('detection')}
-              loading={loading.detection}
-              animDelay={300}
-            />
-          )}
-          {errors.detection && <ErrorBanner msg={errors.detection} />}
+            {/* U-Net Denoising */}
+            {results.unet_denoising && (
+              <StepCard
+                stepId="unet_denoising"
+                label="U-Net Denoising"
+                subStep="1c"
+                description={results.unet_denoising.description}
+                result={results.unet_denoising}
+                status={loading.unet_denoising ? 'loading' : 'success'}
+                onRerun={(f) => runStep('unet_denoising', f)}
+                onRerunWithCurrent={() => runStep('unet_denoising')}
+                loading={loading.unet_denoising}
+                animDelay={200}
+              />
+            )}
+            {errors.unet_denoising && <ErrorBanner msg={errors.unet_denoising} />}
 
-          {/* Fish Selection Editor — always shown under detection */}
-          {results.detection && annotatorImage && (
-            <FishAnnotator
-              imageBase64={annotatorImage}
-              initialBoxes={results.detection.boxes ?? []}
-              onRunUpscaling={handleManualUpscaling}
-              loading={loading.upscaling}
-              animDelay={350}
-            />
-          )}
+            {/* Fish Detection */}
+            {results.detection && (
+              <StepCard
+                stepId="detection"
+                label="Fish Detection"
+                subStep="2"
+                description={results.detection.description}
+                result={results.detection}
+                status={loading.detection ? 'loading' : 'success'}
+                onRerun={(f) => runStep('detection', f)}
+                onRerunWithCurrent={() => runStep('detection')}
+                loading={loading.detection}
+                animDelay={300}
+              />
+            )}
+            {errors.detection && <ErrorBanner msg={errors.detection} />}
 
-          {/* Upscaling */}
-          {hasUpscalingResult && (
-            <StepCardUpscaling
-              crops={upscalingCrops}
-              upscaled={upscalingUpscaled}
-              cropUrls={upscalingCropUrls}
-              upscaledUrls={upscalingUpscaledUrls}
-              method={upscalingMethod}
-              fishCount={upscalingFishCount}
-              onRerun={(f) => runStep('upscaling', f)}
-              onRerunWithCurrent={() => runStep('upscaling')}
-              loading={loading.upscaling}
-              animDelay={400}
-            />
-          )}
-          {errors.upscaling && <ErrorBanner msg={errors.upscaling} />}
-        </section>
+            {/* Fish Selection Editor — always shown under detection */}
+            {results.detection && annotatorImage && (
+              <FishAnnotator
+                imageBase64={annotatorImage}
+                initialBoxes={results.detection.boxes ?? []}
+                onRunUpscaling={handleManualUpscaling}
+                loading={loading.upscaling}
+                animDelay={350}
+              />
+            )}
 
-        {/* Empty state */}
-        {!Object.keys(results).length && !pipelineRunning && !loading.all && (
+            {/* Upscaling */}
+            {hasUpscalingResult && (
+              <StepCardUpscaling
+                crops={upscalingCrops}
+                upscaled={upscalingUpscaled}
+                cropUrls={upscalingCropUrls}
+                upscaledUrls={upscalingUpscaledUrls}
+                method={upscalingMethod}
+                fishCount={upscalingFishCount}
+                onRerun={(f) => runStep('upscaling', f)}
+                onRerunWithCurrent={() => runStep('upscaling')}
+                loading={loading.upscaling}
+                animDelay={400}
+              />
+            )}
+            {errors.upscaling && <ErrorBanner msg={errors.upscaling} />}
+
+            {/* Empty state */}
+            {!Object.keys(results).length && !pipelineRunning && !loading.all && (
+              <div className="text-center py-16 text-white/20">
+                <div className="text-5xl mb-4 animate-float">🌊</div>
+                <p className="text-lg font-medium">Upload an image and run the pipeline</p>
+                <p className="text-sm mt-1">Results will appear here step by step</p>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Empty state — no file at all */}
+        {!file && (
           <div className="text-center py-16 text-white/20">
             <div className="text-5xl mb-4 animate-float">🌊</div>
-            <p className="text-lg font-medium">Upload an image and run the pipeline</p>
-            <p className="text-sm mt-1">Results will appear here step by step</p>
+            <p className="text-lg font-medium">Upload an image or video to get started</p>
+            <p className="text-sm mt-1">Supports JPEG, PNG, WebP · MP4, AVI, MOV, WebM</p>
           </div>
         )}
       </main>
@@ -592,7 +801,7 @@ export default function App() {
       {/* ── Footer ───────────────────────────────────────────────────────── */}
       <footer className="relative z-10 border-t border-white/5 mt-20 py-8 text-center">
         <p className="text-white/20 text-sm">
-          BlurryFish &mdash; Underwater image restoration pipeline
+          BlurryFish &mdash; Underwater image &amp; video restoration pipeline
         </p>
       </footer>
     </div>

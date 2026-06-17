@@ -120,6 +120,62 @@ export async function* runFullPipeline(
   }
 }
 
+// ─── Video pipeline via SSE ───────────────────────────────────────────────────
+
+export async function* runVideoProcessing(
+  file: File,
+  signal?: AbortSignal
+): AsyncGenerator<SSEEvent> {
+  const fd = new FormData();
+  fd.append('file', file);
+
+  const res = await fetch(`${API_BASE}/process-video`, {
+    method: 'POST',
+    body: fd,
+    signal,
+  });
+
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(detail?.detail ?? `HTTP ${res.status}`);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const raw = trimmed.slice(5).trim();
+      if (raw === '[DONE]') return;
+      try {
+        yield JSON.parse(raw) as SSEEvent;
+      } catch {
+        // ignore malformed lines
+      }
+    }
+  }
+}
+
+/**
+ * Build the full URL to download a processed video by job ID.
+ * Works for the memory backend; cloud backends return a direct URL
+ * already in the video_done SSE event.
+ */
+export function videoDownloadUrl(downloadUrl: string): string {
+  if (downloadUrl.startsWith('http')) return downloadUrl;
+  return `${API_BASE}${downloadUrl}`;
+}
+
 // ─── Download helper ──────────────────────────────────────────────────────────
 
 /**

@@ -23,12 +23,14 @@ Individual step endpoints
 
 Full pipeline (SSE stream)
 ──────────────────────────
-  POST /process                 raw image → SSE stream of all step results
+  POST /process                 raw image  → SSE stream of all step results
+  POST /process-video           raw video  → SSE stream of progress + final video URL
 
 Storage & job management
 ─────────────────────────
-  GET  /download/{job_id}/{step}  download a saved step image (memory backend)
-  DELETE /jobs/{job_id}           delete all images for a job
+  GET  /download/{job_id}/{step}       download a saved step image (memory backend)
+  GET  /download-video/{job_id}        download the processed video (memory backend)
+  DELETE /jobs/{job_id}                delete all images/videos for a job
 
 Utility
 ───────
@@ -43,6 +45,7 @@ import uuid
 import json
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, List, Optional
 
@@ -177,8 +180,10 @@ app.add_middleware(
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-_ALLOWED_TYPES  = ("image/jpeg", "image/png", "image/webp")
-_MAX_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+_ALLOWED_TYPES        = ("image/jpeg", "image/png", "image/webp")
+_MAX_IMG_SIZE_BYTES   = 20  * 1024 * 1024  # 20 MB
+_ALLOWED_VIDEO_TYPES  = ("video/mp4", "video/avi", "video/quicktime", "video/webm", "video/x-msvideo")
+_MAX_VIDEO_SIZE_BYTES = 200 * 1024 * 1024  # 200 MB
 
 
 async def _read_image(file: UploadFile) -> np.ndarray:
@@ -189,12 +194,51 @@ async def _read_image(file: UploadFile) -> np.ndarray:
             detail=f"Unsupported file type '{file.content_type}'. Use JPEG, PNG, or WebP.",
         )
     raw = await file.read()
-    if len(raw) > _MAX_SIZE_BYTES:
+    if len(raw) > _MAX_IMG_SIZE_BYTES:
         raise HTTPException(status_code=413, detail="File too large. Maximum size is 20 MB.")
     try:
         return bytes_to_bgr(raw)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+async def _save_video_upload(file: UploadFile) -> str:
+    """
+    Validate and stream a video upload to a temp file on disk.
+    Returns the temp file path (caller must delete it when done).
+    OpenCV VideoCapture cannot read from raw bytes, so we need a real path.
+    """
+    if file.content_type not in _ALLOWED_VIDEO_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported file type '{file.content_type}'. "
+                "Accepted: MP4, AVI, MOV, WebM."
+            ),
+        )
+    # Determine suffix for OpenCV codec detection
+    suffix_map = {
+        "video/mp4":       ".mp4",
+        "video/avi":       ".avi",
+        "video/x-msvideo": ".avi",
+        "video/quicktime": ".mov",
+        "video/webm":      ".webm",
+    }
+    suffix = suffix_map.get(file.content_type, ".mp4")
+
+    raw = await file.read()
+    if len(raw) > _MAX_VIDEO_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Video too large. Maximum size is 200 MB.",
+        )
+
+    # Write to a named temp file that persists until we explicitly delete it
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(raw)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
 
 
 def _bgr_to_png_bytes(img_bgr: np.ndarray) -> bytes:
@@ -614,6 +658,178 @@ def _done_event() -> str:
     return "data: [DONE]\n\n"
 
 
+# ---------------------------------------------------------------------------
+# Video processing helpers
+# ---------------------------------------------------------------------------
+
+def _apply_temporal_smoothing(
+    frame: np.ndarray,
+    smoothed: dict,
+    alpha: float = 0.1,
+) -> np.ndarray:
+    """
+    Apply the temporal EWMA smoothing from the Colab reference code.
+
+    Smooths both the CLAHE clip-limit decision (via L-channel mean) and
+    per-channel RGB scaling, so that brightness/colour don't flicker
+    between frames.
+
+    `smoothed` is a mutable dict that carries state across frames:
+      { 'l_mean': float|None, 'r_mean': float|None,
+        'g_mean': float|None, 'b_mean': float|None }
+    """
+    # ── CLAHE in LAB space ────────────────────────────────────────────────
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    current_l_mean = float(np.mean(l))
+    if smoothed["l_mean"] is None:
+        smoothed["l_mean"] = current_l_mean
+    else:
+        smoothed["l_mean"] = alpha * current_l_mean + (1.0 - alpha) * smoothed["l_mean"]
+
+    clip_limit = 2.0 if smoothed["l_mean"] > 100 else 1.5
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    lab_enhanced = cv2.merge([clahe.apply(l), a, b])
+    after_clahe = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+    # ── Per-channel colour normalisation ─────────────────────────────────
+    b_ch, g_ch, r_ch = cv2.split(after_clahe.astype(np.float32))
+
+    current_r = float(np.mean(r_ch))
+    current_g = float(np.mean(g_ch))
+    current_b = float(np.mean(b_ch))
+
+    if smoothed["r_mean"] is None:
+        smoothed["r_mean"] = current_r
+        smoothed["g_mean"] = current_g
+        smoothed["b_mean"] = current_b
+    else:
+        smoothed["r_mean"] = alpha * current_r + (1.0 - alpha) * smoothed["r_mean"]
+        smoothed["g_mean"] = alpha * current_g + (1.0 - alpha) * smoothed["g_mean"]
+        smoothed["b_mean"] = alpha * current_b + (1.0 - alpha) * smoothed["b_mean"]
+
+    # Avoid division by zero
+    r_scale = smoothed["r_mean"] / current_r if current_r > 0 else 1.0
+    g_scale = smoothed["g_mean"] / current_g if current_g > 0 else 1.0
+    b_scale = smoothed["b_mean"] / current_b if current_b > 0 else 1.0
+
+    r_ch = np.clip(r_ch * r_scale, 0, 255).astype(np.uint8)
+    g_ch = np.clip(g_ch * g_scale, 0, 255).astype(np.uint8)
+    b_ch = np.clip(b_ch * b_scale, 0, 255).astype(np.uint8)
+
+    return cv2.merge([b_ch, g_ch, r_ch])
+
+
+async def _process_video_stream(
+    video_path: str,
+    job_id: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Full video pipeline:
+      1. Temporal smoothing (EWMA, α=0.1, capped at fps×10 frames)
+      2. CLAHE → Color Correction → U-Net denoising (per frame)
+      3. Fish detection with bounding-box overlay
+      4. Reassemble frames → MP4
+    Yields SSE events for start / progress / done.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        yield _sse({"step": "video_error", "error": "Could not open video file."})
+        yield _done_event()
+        return
+
+    width      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps        = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    max_frames = int(fps * 10)  # 10-second cap
+
+    # Count total frames (capped)
+    raw_total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    total_frames = min(raw_total, max_frames) if raw_total > 0 else max_frames
+
+    yield _sse({
+        "step":        "video_start",
+        "totalFrames": total_frames,
+        "fps":         fps,
+        "width":       width,
+        "height":      height,
+        "job_id":      job_id,
+    })
+
+    # Temp output file
+    out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    out_tmp_path = out_tmp.name
+    out_tmp.close()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_tmp_path, fourcc, fps, (width, height))
+
+    smoothed = {"l_mean": None, "r_mean": None, "g_mean": None, "b_mean": None}
+    frame_idx = 0
+    PROGRESS_EVERY = max(1, total_frames // 20)  # emit ~20 progress events
+
+    try:
+        while frame_idx < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 1. Temporal smoothing
+            smoothed_frame = _apply_temporal_smoothing(frame, smoothed)
+
+            # 2. Color correction (channel-mean normalisation)
+            restored = apply_color_correction(smoothed_frame)
+
+            # 3. U-Net denoising
+            restored = apply_unet_denoising(restored, _models.get("unet"))
+
+            # 4. Fish detection overlay
+            annotated, _ = detect_fish(restored, _models.get("yolo"))
+
+            writer.write(annotated)
+            frame_idx += 1
+
+            if frame_idx % PROGRESS_EVERY == 0 or frame_idx == total_frames:
+                percent = round((frame_idx / total_frames) * 100)
+                yield _sse({
+                    "step":        "video_progress",
+                    "frame":       frame_idx,
+                    "totalFrames": total_frames,
+                    "percent":     percent,
+                    "job_id":      job_id,
+                })
+
+    finally:
+        cap.release()
+        writer.release()
+        try:
+            os.unlink(video_path)   # delete upload temp
+        except OSError:
+            pass
+
+    # Save finished video to storage
+    with open(out_tmp_path, "rb") as vf:
+        video_bytes = vf.read()
+    try:
+        os.unlink(out_tmp_path)
+    except OSError:
+        pass
+
+    # Store under a special key "video" for this job
+    _storage.save(job_id, "video", video_bytes, ext="mp4")
+    download_url = f"/download-video/{job_id}"
+
+    yield _sse({
+        "step":         "video_done",
+        "frameCount":   frame_idx,
+        "totalFrames":  total_frames,
+        "download_url": download_url,
+        "job_id":       job_id,
+    })
+    yield _done_event()
+
+
 async def _full_pipeline_stream(img_bgr: np.ndarray) -> AsyncGenerator[str, None]:
     """Chains all 5 step functions and streams each result as an SSE event."""
     job_id = _new_job_id()
@@ -714,5 +930,72 @@ async def process_image(file: UploadFile = File(...)):
         headers={
             "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video pipeline — SSE stream
+# ---------------------------------------------------------------------------
+
+@app.post("/process-video", tags=["Full Pipeline"])
+async def process_video(file: UploadFile = File(...)):
+    """
+    **Video Pipeline — SSE Stream**
+
+    Accepts an MP4, AVI, MOV, or WebM video (≤ 200 MB, ≤ 10 seconds processed).
+
+    Pipeline per frame:
+      1. Temporal EWMA smoothing (α=0.1, L-channel + per-channel RGB)
+      2. CLAHE contrast enhancement
+      3. Color correction
+      4. U-Net denoising
+      5. YOLOv8 fish detection with bounding-box overlay
+
+    Streams SSE events:
+      - `video_start`    — metadata (fps, dimensions, totalFrames)
+      - `video_progress` — frame count + percent (~20 updates)
+      - `video_done`     — download_url for the processed MP4
+    """
+    video_path = await _save_video_upload(file)
+    job_id     = _new_job_id()
+    logger.info("/process-video — job=%s file=%s", job_id, video_path)
+
+    return StreamingResponse(
+        _process_video_stream(video_path, job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/download-video/{job_id}", tags=["Storage"])
+async def download_video(job_id: str):
+    """
+    Download the processed video for a job (memory backend only).
+
+    For cloud backends, use the `download_url` from the `video_done` SSE event.
+    """
+    from utils.storage import MemoryBackend
+    if not isinstance(_storage, MemoryBackend):
+        raise HTTPException(
+            status_code=404,
+            detail="This endpoint only serves files from the memory backend.",
+        )
+    data = _storage.get(job_id, "video")
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No processed video found for job '{job_id}'.",
+        )
+    return Response(
+        content=data,
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="blurryfish_{job_id}.mp4"',
+            "Cache-Control":       "no-cache",
+            "Content-Length":      str(len(data)),
         },
     )
